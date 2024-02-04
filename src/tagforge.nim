@@ -12,10 +12,13 @@
 #! See the License for the specific language governing permissions and
 #! limitations under the License.
 import std/[
-  strformat,
   streams,
-  options
+  tables,
+  json
 ]
+
+import zippy
+import mutf8
 
 import tagforge/private/stew/endians2
 
@@ -27,11 +30,12 @@ type
 
   TagFormat* = enum
     ## The fornat for parsing/dumping NBT
-    BE, LE, VI # BigEndian, LittleEndian, VarInt
+    BE, LE # BigEndian, LittleEndian
+    # TODO: Implement VarInt encoding, seems a lot more tedious though...
 
   TagNodeKind* = enum
     ## NBT tags
-    End = 0x00'b
+    End = 0x00.byte
     Byte = 0x01
     Short = 0x02
     Int = 0x03
@@ -45,13 +49,11 @@ type
     IntArray = 0x0B
     LongArray = 0x0C
 
-  NamedTag* = object
-    name*: string
-    node*: TagNode
-
-  TagNodeObj* {.acyclic.} = object
+  TagNode* {.acyclic.} = ref object
     ## NBT node type
     # Acyclic since it'll never have a reference to itself, only children
+    name: string
+
     case kind*: TagNodeKind
       of End:
         discard
@@ -85,8 +87,7 @@ type
         listVal*: seq[TagNode]
 
       of Compound:
-        name*: Option[string]
-        compoundVal*: seq[NamedTag]
+        compoundVal*: Table[string, TagNode]
 
       of IntArray:
         intArrVal*: seq[int32]
@@ -94,83 +95,249 @@ type
       of LongArray:
         longArrVal*: seq[int64]
 
-  TagNode* = ref TagNodeObj ## NBT node type
+func `[]`*(node: TagNode, name: string): TagNode =
+  ## Access a named tag
+  if node.kind != Compound:
+    raise newException(TagValidationError, "Expected type `Compound` but got `" & $node.kind & "`!")
 
-func newTagCompound*(name: string, compoundVal = newSeq[NamedTag]()): TagNode =
-  ## Create a new named compound tag.
-  TagNode(kind: Compound, name: name, compoundVal: compoundVal)
+  node.compoundVal[name]
 
-func newTagCompound*(compoundVal = newSeq[NamedTag]()): TagNode =
-  ## Create a new unnamed compound tag (an empty string is used as a placeholder).
-  TagNode(kind: Compound, name: "", compoundVal: compoundVal)
+func `[]=`*(node: TagNode, name: string, value: TagNode) =
+  ## Set a named tag
+  if node.kind != Compound:
+    raise newException(TagValidationError, "Expected type `Compound` but got `" & $node.kind & "`!")
 
-func newTagList*(typ: TagNodeKind, listVal = newSeq[TagNode]()): TagNode {.raises: [TagValidationError].} =
-  ## Create a new list tag with a type!
-  result = TagNode(kind: List, typ: typ, listVal: listVal)
+  node.compoundVal[name] = value
 
-  when not (defined(danger) or defined(tagForgeNoValidation)):
-    # Disable with d:danger
-    for i in listVal:
-      if i.kind != typ:
-        raise newException(TagValidationError, &"Index {i} expected type `{typ}` but got `{i.kind}`!")
 
-template readNodeKind(data: Stream): TagNodeKind =
-  try:
-    TagNodeKind(data.readUint8().byte)
-  except RangeDefect:
-    raise newException(TagParsingError, fmt"Invalid node type at position {data.getPosition() - 1}")
+func newTagByte*(x: int8): TagNode =
+  ## Returns a byte TagNode with a signed byte as the value.
+  TagNode(kind: Byte, byteVal: x)
 
-proc readSignedInt(data: Stream): int32 =
-  when cpuEndian != BigEndian:
-    let listSize = cast[int32](data.readUint32().toLE())
+func newTagShort*(x: int16): TagNode =
+  ## Returns a short TagNode with a signed short as the value.
+  TagNode(kind: Short, shortVal: x)
+
+func newTagInt*(x: int32): TagNode =
+  ## Returns an int TagNode with a signed int as the value.
+  TagNode(kind: Int, intVal: x)
+
+func newTagLong*(x: int64): TagNode =
+  ## Returns a long TagNode with a signed long as the value.
+  TagNode(kind: Long, longVal: x)
+
+func newTagFloat*(x: float32): TagNode =
+  ## Returns a float TagNode with a float as the value.
+  TagNode(kind: Float, floatVal: x)
+
+func newTagDouble*(x: float64): TagNode =
+  ## Returns a double TagNode with a double as the value.
+  TagNode(kind: Double, doubleVal: x)
+
+func newTagByteArray*(x = newSeq[int8]()): TagNode =
+  ## Returns a byte array TagNode with a seq[int8] as the value.
+  TagNode(kind: ByteArray, byteArrVal: x)
+
+func newTagString*(x = ""): TagNode =
+  ## Returns a string TagNode with a string as the value.
+  TagNode(kind: String, strVal: x)
+
+func newTagList*(typ: TagNodeKind, x = newSeq[TagNode]()): TagNode {.raises: [TagValidationError].} =
+  ## Returns a list TagNode with a seq[TagNode] as the value.
+  for i in x:
+    if i.kind != typ:
+      raise newException(TagValidationError, "Expected type `" & $typ & "` but got `" & $i.kind & "`!")
+
+  TagNode(kind: List, typ: typ, listVal: x)
+
+func newTagCompound*(x = initTable[string, TagNode]()): TagNode =
+  ## Returns a compound TagNode with a Table[string, TagNode] as the value.
+  TagNode(kind: Compound, compoundVal: x)
+
+func newTagIntArray*(x = newSeq[int32]()): TagNode =
+  ## Returns an int array TagNode with a seq[int32] as the value.
+  TagNode(kind: IntArray, intArrVal: x)
+
+func newTagLongArray*(x = newSeq[int64]()): TagNode =
+  ## Returns a long array TagNode with a seq[int64] as the value.
+  TagNode(kind: LongArray, longArrVal: x)
+
+# Format-specific reading
+proc read[T: SomeNumber](s: Stream, format: TagFormat): T =
+  ## Read a number from a string using a specific format
+  const size = sizeof T
+
+  template fromBytesFormat[T: SomeEndianInt](typ: typedesc[T]): T =
+    if format == BE:
+      fromBytesBE(typ, cast[seq[byte]](s.readStr(size)))
+    else:
+      fromBytesLE(typ, cast[seq[byte]](s.readStr(size)))
+
+  when size == 1:
+    result = cast[T](fromBytesFormat(uint8))
+
+  elif size == 2:
+    result = cast[T](fromBytesFormat(uint16))
+
+  elif size == 4:
+    result = cast[T](fromBytesFormat(uint32))
+
+  elif size == 8:
+    result = cast[T](fromBytesFormat(uint64))
+
   else:
-    let listSize = data.readInt32()
+    {.error: "Unsupported type.".}
 
-proc parse*(data: Stream, format=BE, nodeLimit=1024,
-  networkFormat: bool = false): TagNode =
-  ## Parses NBT data from a stream.
-  ## `format` defaults to BigEndian decoding.
-  ## `networkFormat` is specific to Java 1.20.2 and onwards.
-  var
-    depth = 0
-    nodesParsed = 0
-    root = newTagCompound()
-    parent = @[root]
+proc readString(s: Stream, format: TagFormat): string =
+  let length = s.read[:uint16](format).int
+  return decodeMutf8(cast[seq[byte]](s.readStr(length)))
 
-  while not data.atEnd:
-    if nodesParsed >= nodeLimit:
-      raise newException(TagDataTooLarge, "")
+# This code is taken from https://github.com/Yardanico/nimnbt/blob/master/src/nimnbt.nim#L60-L120
+# which was licensed under MIT
+proc parseNbtInternal(s: Stream, format: TagFormat, tagKind = End, parseName: static bool = true): TagNode =
+  try:
+    result = TagNode(kind: if tagKind == End: TagNodeKind(s.readUint8()) else: tagKind)
+  except IOError:
+    return TagNode(kind: End)
 
-    let
-      typ = data.readNodeKind()
-      parentCompound = parent[^1].kind == Compound
+  if result.kind == End: return
 
-    # Handle outer compound type
-    if parentCompound:
-      # If compound type
-      if typ == Compound:
-        parent[^1].compoundVal.add newTagCompound()
-        inc nodesParsed
-        # If not network format, read name
-        if not (networkFormat and (depth == 0)):
-          parent[^1].compoundVal[^1].name = data.readStr(data.readSignedInt())
+  if parseName: result.name = s.readString(format)
+  case result.kind
+    of End: return
+    of Byte:
+      result.byteVal = s.readInt8()
+    of Short:
+      result.shortVal = s.read[:int16](format)
+    of Int:
+      result.intVal = s.read[:int32](format)
+    of Long:
+      result.longVal = s.read[:int64](format)
+    of Float:
+      result.floatVal = s.read[:float32](format)
+    of Double:
+      result.doubleVal = s.read[:float64](format)
+    of ByteArray:
+      let size = s.read[:int32](format)
+      var i = 0
+      result.byteArrVal = newSeqOfCap[int8](size)
 
-        # Add as parent
-        parent.add parent[^1].compoundVal[^1].node
-        inc depth
-        continue
+      while i < size:
+        result.byteArrVal.add(s.readInt8())
+        inc i
+    of String:
+      result.strVal = s.readString(format)
+    of List:
+      result.typ = s.read[:uint8](format).TagNodeKind
+      let size = s.read[:uint32](format).int
+      var i = 0
+      result.listVal = newSeqOfCap[TagNode](size)
 
-      if typ == List:
-        # The type + size of the list
-        let
-          listTyp = data.readNodeKind()
-          listSize = data.readSignedInt()
+      while i < size:
+        # Tags in lists don't have names at all
+        result.listVal.add(s.parseNbtInternal(format, result.typ, parseName = false))
+        inc i
+    of Compound:
+      result.compoundVal = initTable[string, TagNode]()
+      while true:
+        var nextTag = s.parseNbtInternal(format)
+        if nextTag.kind == End: break
+        result.compoundVal[nextTag.name] = nextTag
+    of IntArray:
+      let size = s.read[:int32](format).int
+      var i = 0
+      result.intArrVal = newSeqOfCap[int32](size)
 
-        # The list itself
-        var list = newSeq[TagNode](listSize)
+      while i < size:
+        result.intArrVal.add s.read[:int32](format)
+        inc(i)
+    of LongArray:
+      let size = s.read[:int32](format).int
+      var i = 0
+      result.longArrVal = newSeqOfCap[int64](size)
 
-        parent[^1].compoundVal.add newTagList(listTyp, list)
-        inc nodesParsed
-        parent.add parent[^1].compoundVal[^1].node
-        inc depth
-        continue
+      while i < size:
+        result.longArrVal.add s.read[:int64](format)
+        inc(i)
+
+proc parseNbt*(s: string, format = BE, network = false): TagNode =
+  ## Parses NBT data structure from the string *s*
+  ## 
+  ## *format* specifies the endianness of the data
+  ## *network* specifies whether the data is sent over the network
+  result = newTagCompound()
+
+  var strm: Stream
+  try:
+    strm = newStringStream(s.uncompress)
+  except ZippyError:
+    strm = newStringStream(s)
+
+  if network:
+    result[""] = strm.parseNbtInternal(format, parseName = false)
+  else:
+    while true:
+      var nextTag = strm.parseNbtInternal(format)
+      if nextTag.kind == End: break
+      result.compoundVal[nextTag.name] = nextTag
+
+proc toJson*(s: TagNode): JsonNode =
+  ## Converts an NBT tag to the JSON for printing/serialization
+  case s.kind
+    of End:
+      return
+
+    of Byte:
+      result = %s.byteVal
+    of Short:
+      result = %s.shortVal
+    of Int:
+      result = %s.intVal
+    of Long:
+      result = %s.longVal
+    of Float:
+      result = %s.floatVal
+    of Double:
+      result = %s.doubleVal
+    of ByteArray:
+      result = %s.byteArrVal
+    of String:
+      result = %s.strVal
+
+    of List:
+      result = newJArray()
+      for i in s.listVal:
+        result.add toJson(i)
+
+    of Compound:
+      result = newJObject()
+      for k, v in s.compoundVal:
+        result[k] = toJson(v)
+
+    of IntArray:
+      result = %s.intArrVal
+    of LongArray:
+      result = %s.longArrVal
+
+proc `$`*(t: TagNode): string =
+  ## Converts Tag to a string for easier debugging/visualising
+  $toJson(t)
+
+func `==`*(a, b: TagNode): bool =
+  ## Compares two tags
+  if a.kind != b.kind: return false
+
+  case a.kind
+    of End: return true
+    of Byte: return a.byteVal == b.byteVal
+    of Short: return a.shortVal == b.shortVal
+    of Int: return a.intVal == b.intVal
+    of Long: return a.longVal == b.longVal
+    of Float: return a.floatVal == b.floatVal
+    of Double: return a.doubleVal == b.doubleVal
+    of ByteArray: return a.byteArrVal == b.byteArrVal
+    of String: return a.strVal == b.strVal
+    of List: return a.listVal == b.listVal
+    of Compound: return a.compoundVal == b.compoundVal
+    of IntArray: return a.intArrVal == b.intArrVal
+    of LongArray: return a.longArrVal == b.longArrVal
