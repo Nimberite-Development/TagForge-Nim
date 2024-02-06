@@ -109,6 +109,19 @@ func `[]=`*(node: TagNode, name: string, value: TagNode) =
 
   node.compoundVal[name] = value
 
+func `[]`*(node: TagNode, idx: int): TagNode =
+  ## Access a list tag
+  if node.kind != List:
+    raise newException(TagValidationError, "Expected type `Compound` but got `" & $node.kind & "`!")
+
+  node.listVal[idx]
+
+func `[]=`*(node: TagNode, idx: int, value: TagNode) =
+  ## Set a list tag
+  if node.kind != List:
+    raise newException(TagValidationError, "Expected type `Compound` but got `" & $node.kind & "`!")
+
+  node.listVal[idx] = value
 
 func newTagByte*(x: int8): TagNode =
   ## Returns a byte TagNode with a signed byte as the value.
@@ -162,16 +175,76 @@ func newTagLongArray*(x = newSeq[int64]()): TagNode =
   ## Returns a long array TagNode with a seq[int64] as the value.
   TagNode(kind: LongArray, longArrVal: x)
 
+func getByte*(node: TagNode): int8 =
+  ## Get the byte value of a byte TagNode
+  if node.kind != Byte:
+    raise newException(TagValidationError, "Expected type `Byte` but got `" & $node.kind & "`!")
+  node.byteVal
+
+func getShort*(node: TagNode): int16 =
+  ## Get the short value of a short TagNode
+  if node.kind != Short:
+    raise newException(TagValidationError, "Expected type `Short` but got `" & $node.kind & "`!")
+  node.shortVal
+
+func getInt*(node: TagNode): int32 =
+  ## Get the int value of an int TagNode
+  if node.kind != Int:
+    raise newException(TagValidationError, "Expected type `Int` but got `" & $node.kind & "`!")
+  node.intVal
+
+func getLong*(node: TagNode): int64 =
+  ## Get the long value of a long TagNode
+  if node.kind != Long:
+    raise newException(TagValidationError, "Expected type `Long` but got `" & $node.kind & "`!")
+  node.longVal
+
+func getFloat*(node: TagNode): float32 =
+  ## Get the float value of a float TagNode
+  if node.kind != Float:
+    raise newException(TagValidationError, "Expected type `Float` but got `" & $node.kind & "`!")
+  node.floatVal
+
+func getDouble*(node: TagNode): float64 =
+  ## Get the double value of a double TagNode
+  if node.kind != Double:
+    raise newException(TagValidationError, "Expected type `Double` but got `" & $node.kind & "`!")
+  node.doubleVal
+
+func getByteArray*(node: TagNode): seq[int8] =
+  ## Get the byte array value of a byte array TagNode
+  if node.kind != ByteArray:
+    raise newException(TagValidationError, "Expected type `ByteArray` but got `" & $node.kind & "`!")
+  node.byteArrVal
+
+func getString*(node: TagNode): string =
+  ## Get the string value of a string TagNode
+  if node.kind != String:
+    raise newException(TagValidationError, "Expected type `String` but got `" & $node.kind & "`!")
+  node.strVal
+
+func getIntArray*(node: TagNode): seq[int32] =
+  ## Get the int array value of an int array TagNode
+  if node.kind != IntArray:
+    raise newException(TagValidationError, "Expected type `IntArray` but got `" & $node.kind & "`!")
+  node.intArrVal
+
+func getLongArray*(node: TagNode): seq[int64] =
+  ## Get the long array value of a long array TagNode
+  if node.kind != LongArray:
+    raise newException(TagValidationError, "Expected type `LongArray` but got `" & $node.kind & "`!")
+  node.longArrVal
+
 # Format-specific reading
-proc read[T: SomeNumber](s: Stream, format: TagFormat): T =
+proc readNum[T: SomeNumber](s: Stream, format: TagFormat): T =
   ## Read a number from a string using a specific format
   const size = sizeof T
 
   template fromBytesFormat[T: SomeEndianInt](typ: typedesc[T]): T =
     if format == BE:
-      fromBytesBE(typ, cast[seq[byte]](s.readStr(size)))
+      fromBytesBE(typ, s.readStr(size).toOpenArrayByte(0, size - 1))
     else:
-      fromBytesLE(typ, cast[seq[byte]](s.readStr(size)))
+      fromBytesLE(typ, s.readStr(size).toOpenArrayByte(0, size - 1))
 
   when size == 1:
     result = cast[T](fromBytesFormat(uint8))
@@ -189,8 +262,40 @@ proc read[T: SomeNumber](s: Stream, format: TagFormat): T =
     {.error: "Unsupported type.".}
 
 proc readString(s: Stream, format: TagFormat): string =
-  let length = s.read[:uint16](format).int
-  return decodeMutf8(cast[seq[byte]](s.readStr(length)))
+  let length = s.readNum[:uint16](format).int
+  return decodeMutf8(s.readStr(length).toOpenArrayByte(0, length - 1))
+
+proc writeNum[T: SomeNumber](s: Stream, num: T, format: TagFormat) =
+  const size = sizeof T
+
+  template toBytesFormat[T: SomeEndianInt](num: T): array[size, byte] =
+    if format == BE:
+      toBytesBE(num)
+    else:
+      toBytesLE(num)
+
+  when size == 1:
+    s.write toBytesFormat(cast[uint8](num))
+
+  elif size == 2:
+    s.write toBytesFormat(cast[uint16](num))
+
+  elif size == 4:
+    s.write toBytesFormat(cast[uint32](num))
+
+  elif size == 8:
+    s.write toBytesFormat(cast[uint64](num))
+
+  else:
+    {.error: "Unsupported type.".}
+
+proc writeString(s: Stream, str: string, format: TagFormat) =
+  let data = str.encodeMutf8
+  if data.len >= high(uint16).int:
+    raise newException(TagValidationError, "String too long!")
+
+  s.writeNum[:uint16](data.len.uint16, format)
+  s.write(cast[string](data))
 
 # This code is taken from https://github.com/Yardanico/nimnbt/blob/master/src/nimnbt.nim#L60-L120
 # which was licensed under MIT
@@ -206,19 +311,19 @@ proc parseNbtInternal(s: Stream, format: TagFormat, tagKind = End, parseName: st
   case result.kind
     of End: return
     of Byte:
-      result.byteVal = s.readInt8()
+      result.byteVal = s.readNum[:int8](format)
     of Short:
-      result.shortVal = s.read[:int16](format)
+      result.shortVal = s.readNum[:int16](format)
     of Int:
-      result.intVal = s.read[:int32](format)
+      result.intVal = s.readNum[:int32](format)
     of Long:
-      result.longVal = s.read[:int64](format)
+      result.longVal = s.readNum[:int64](format)
     of Float:
-      result.floatVal = s.read[:float32](format)
+      result.floatVal = s.readNum[:float32](format)
     of Double:
-      result.doubleVal = s.read[:float64](format)
+      result.doubleVal = s.readNum[:float64](format)
     of ByteArray:
-      let size = s.read[:int32](format)
+      let size = s.readNum[:int32](format)
       var i = 0
       result.byteArrVal = newSeqOfCap[int8](size)
 
@@ -228,8 +333,8 @@ proc parseNbtInternal(s: Stream, format: TagFormat, tagKind = End, parseName: st
     of String:
       result.strVal = s.readString(format)
     of List:
-      result.typ = s.read[:uint8](format).TagNodeKind
-      let size = s.read[:uint32](format).int
+      result.typ = s.readNum[:uint8](format).TagNodeKind
+      let size = s.readNum[:uint32](format).int
       var i = 0
       result.listVal = newSeqOfCap[TagNode](size)
 
@@ -244,27 +349,27 @@ proc parseNbtInternal(s: Stream, format: TagFormat, tagKind = End, parseName: st
         if nextTag.kind == End: break
         result.compoundVal[nextTag.name] = nextTag
     of IntArray:
-      let size = s.read[:int32](format).int
+      let size = s.readNum[:int32](format).int
       var i = 0
       result.intArrVal = newSeqOfCap[int32](size)
 
       while i < size:
-        result.intArrVal.add s.read[:int32](format)
+        result.intArrVal.add s.readNum[:int32](format)
         inc(i)
     of LongArray:
-      let size = s.read[:int32](format).int
+      let size = s.readNum[:int32](format).int
       var i = 0
       result.longArrVal = newSeqOfCap[int64](size)
 
       while i < size:
-        result.longArrVal.add s.read[:int64](format)
+        result.longArrVal.add s.readNum[:int64](format)
         inc(i)
 
 proc parseNbt*(s: string, format = BE, network = false): TagNode =
   ## Parses NBT data structure from the string *s*
   ## 
-  ## *format* specifies the endianness of the data
-  ## *network* specifies whether the data is sent over the network
+  ## `format` specifies the endianness of the data
+  ## `network` specifies whether the data is sent over the network
   result = newTagCompound()
 
   var strm: Stream
@@ -280,6 +385,86 @@ proc parseNbt*(s: string, format = BE, network = false): TagNode =
       var nextTag = strm.parseNbtInternal(format)
       if nextTag.kind == End: break
       result.compoundVal[nextTag.name] = nextTag
+
+# Dumping code
+proc dumpNbtInternal(s: Stream, format: TagFormat, tag: TagNode, writeName: bool = true,
+  writeType: bool = true, writeEnd: bool = true) =
+
+  if tag.kind != End:
+    if writeType: s.writeNum[:uint8](tag.kind.uint8, format)
+    if writeName: writeString(s, tag.name, format)
+
+  case tag.kind
+    of End:
+      return
+
+    of Byte:
+      s.writeNum[:int8](tag.byteVal, format)
+
+    of Short:
+      s.writeNum[:int16](tag.shortVal, format)
+
+    of Int:
+      s.writeNum[:int32](tag.intVal, format)
+
+    of Long:
+      s.writeNum[:int64](tag.longVal, format)
+
+    of Float:
+      s.writeNum[:float32](tag.floatVal, format)
+
+    of Double:
+      s.writeNum[:float64](tag.doubleVal, format)
+
+    of ByteArray:
+      s.writeNum[:int32](tag.byteArrVal.len.int32, format)
+      for i in tag.byteArrVal:
+        s.writeNum[:int8](i, format)
+
+    of String:
+      writeString(s, tag.strVal, format)
+
+    of List:
+      if tag.listVal.len > high(int32):
+        raise newException(TagValidationError, "List too long!")
+
+      s.writeNum[:uint8](tag.typ.uint8, format)
+      s.writeNum[:int32](tag.listVal.len.int32, format)
+
+      for i in tag.listVal:
+        dumpNbtInternal(s, format, i, writeName = false, writeType = false)
+
+    of Compound:
+      for k, v in tag.compoundVal:
+        v.name = k
+        dumpNbtInternal(s, format, v, writeName = true)
+
+      if writeEnd: s.write[:uint8](End.uint8)
+
+    of IntArray:
+      s.writeNum[:int32](tag.intArrVal.len.int32, format)
+      for i in tag.intArrVal:
+        s.writeNum[:int32](i, format)
+
+    of LongArray:
+      s.writeNum[:int32](tag.longArrVal.len.int32, format)
+      for i in tag.longArrVal:
+        s.writeNum[:int64](i, format)
+
+proc dumpNbt*(s: TagNode, format = BE, network = true): string =
+  ## Writes an NBT tag to a string.
+  ## 
+  ## `format` specifies the endianness of the data
+  ## `network` specifies whether the data is sent over the network
+  var strm = newStringStream()
+
+  if network:
+    dumpNbtInternal(strm, format, s, writeType = false, writeName = false, writeEnd = false)
+  else:
+    dumpNbtInternal(strm, format, s, writeType = false, writeEnd = false)
+
+  strm.setPosition(0)
+  return strm.readAll()
 
 proc toJson*(s: TagNode): JsonNode =
   ## Converts an NBT tag to the JSON for printing/serialization
