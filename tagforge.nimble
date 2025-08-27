@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.1.0"
+version       = "0.1.1"
 author        = "Yu-Vitaqua-fer-Chronos"
 description   = "A library made for the serialisation and deserialisation of MC NBT!"
 license       = "Apache-2.0"

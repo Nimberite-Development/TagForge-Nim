@@ -1,0 +1,17 @@
+format = 0
+
+[package]
+name = "github.com/nimberite-development/tagforge-nim"
+
+[dependencies.mutf8]
+src     = "github.com/the-ticking-clockwork/mutf-8"
+origin  = "git"
+scheme  = "https"
+version = "0.1.1"
+
+[dependencies.zippy]
+src        = "github.com/guzba/zippy"
+origin     = "git"
+scheme     = "https"
+version    = "0.10.11"
+foreign-pm = "nimble"
